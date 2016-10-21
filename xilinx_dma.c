@@ -2,6 +2,7 @@
  * DMA driver for Xilinx DMA Engine
  *
  * Copyright (C) 2010 - 2015 Xilinx, Inc. All rights reserved.
+ * Copyright (C) 2016 Ping DSP, Inc. All rights reserved.
  *
  * Based on the Freescale DMA driver.
  *
@@ -31,7 +32,7 @@
 #include <linux/of_platform.h>
 #include <linux/slab.h>
 
-#include "../dmaengine.h"
+#include "dmaengine.h"
 
 /* Register Offsets */
 #define XILINX_DMA_REG_CONTROL		0x00
@@ -109,21 +110,19 @@
 /**
  * struct xilinx_dma_desc_hw - Hardware Descriptor
  * @next_desc: Next Descriptor Pointer @0x00
- * @next_desc_msb: MSB of Next Descriptor Pointer @0x04
+ * @next_desc_msb: MSB of Next Descriptor Pointer @0x04  OBSOLETE, using dma_addr_t and alignment
  * @buf_addr: Buffer address @0x08
- * @buf_addr_msb: MSB of Buffer address @0x0C
- * @pad1: Reserved @0x10
+ * @buf_addr_msb: MSB of Buffer address @0x0C  OBSOLETE, using dma_addr_t and alignment
+ * @pad1: Reserved @0x10   Needs to be aligned incase buf_addr is only 4 bytes.
  * @pad2: Reserved @0x14
  * @control: Control field @0x18
  * @status: Status field @0x1C
  * @app: APP Fields @0x20 - 0x30
  */
 struct xilinx_dma_desc_hw {
-	u32 next_desc;
-	u32 next_desc_msb;
-	u32 buf_addr;
-	u32 buf_addr_msb;
-	u32 mcdma_fields;
+	dma_addr_t next_desc __aligned(8); 	
+	dma_addr_t buf_addr  __aligned(8);	
+	u32 mcdma_fields     __aligned(8);
 	u32 vsize_stride;
 	u32 control;
 	u32 status;
@@ -232,45 +231,59 @@ struct xilinx_dma_device {
 /* Macros */
 #define to_xilinx_chan(chan) \
 	container_of(chan, struct xilinx_dma_chan, common)
-#define to_dma_tx_descriptor(tx) \
+#define to_xilinx_tx_descriptor(tx) \
 	container_of(tx, struct xilinx_dma_tx_descriptor, async_tx)
 
-/* IO accessors */
-static inline void dma_write(struct xilinx_dma_chan *chan, u32 reg, u32 value)
-{
-	iowrite32(value, chan->xdev->regs + reg);
-}
-
-#if defined(CONFIG_PHYS_ADDR_T_64BIT)
-static inline void dma_writeq(struct xilinx_dma_chan *chan, u32 reg, u64 value)
-{
-	writeq(value, chan->xdev->regs + reg);
-}
-#endif
-
-static inline u32 dma_read(struct xilinx_dma_chan *chan, u32 reg)
-{
-	return ioread32(chan->xdev->regs + reg);
-}
-
+/* IO accessors
+ *
+ * Accessors for the registers of each channel using the base address of the
+ * device (xdev->regs) plus the offset of the channel plus the offset of the
+ * regiseter.
+ *
+ * Note: Removed dma_write / dma_read to make sure we don't 
+ *       accidentally use them, since they are not required.
+ */
 static inline u32 dma_ctrl_read(struct xilinx_dma_chan *chan, u32 reg)
-{
-	return dma_read(chan, chan->ctrl_offset + reg);
+{	
+	return ioread32(chan->xdev->regs + chan->ctrl_offset + reg);
 }
 
 static inline void dma_ctrl_write(struct xilinx_dma_chan *chan, u32 reg,
 				  u32 value)
 {
-	dma_write(chan, chan->ctrl_offset + reg, value);
+	/* Combine the device register base address (regs) with
+	 * the channel control offset, and the register offset and
+	 * issue a 32-bit write.
+	 */	
+	iowrite32(value, chan->xdev->regs + chan->ctrl_offset + reg);
 }
 
-#if defined(CONFIG_PHYS_ADDR_T_64BIT)
+#ifdef CONFIG_PHYS_ADDR_T_64BIT	
 static inline void dma_ctrl_writeq(struct xilinx_dma_chan *chan, u32 reg,
 				   u64 value)
 {
-	dma_writeq(chan, chan->ctrl_offset + reg, value);
+	/* Same but for a 64-bit write.
+	 */
+	writeq(value, chan->xdev->regs + chan->ctrl_offset + reg);	
 }
 #endif
+
+/* Automatically choose the correct of either write or writeq depending on dma_addr_t
+ * or more specifically on the define that defines dma_addr_t as either u32 or u64. 
+ *
+ * Note: we're actually using the define for phys_addr_t, which raises the question
+ * should we be using phys_addr_t?
+ * Purpose: to cut down on the number of ifdefs required in this driver!
+ */
+static inline void dma_ctrl_write_addr(struct xilinx_dma_chan *chan, u32 reg,
+	                               dma_addr_t value)
+{
+#ifdef CONFIG_PHYS_ADDR_T_64BIT	
+	dma_ctrl_writeq(chan, reg, value);
+#else
+	dma_ctrl_write(chan, reg, value);
+#endif
+}
 
 /* -----------------------------------------------------------------------------
  * Descriptors and segments alloc and free
@@ -306,13 +319,11 @@ xilinx_dma_alloc_tx_segment(struct xilinx_dma_chan *chan)
  */
 static void xilinx_dma_clean_hw_desc(struct xilinx_dma_desc_hw *hw)
 {
-	u32 next_desc = hw->next_desc;
-	u32 next_desc_msb = hw->next_desc_msb;
+	dma_addr_t next_desc = hw->next_desc;
 
 	memset(hw, 0, sizeof(struct xilinx_dma_desc_hw));
 
 	hw->next_desc = next_desc;
-	hw->next_desc_msb = next_desc_msb;
 }
 
 /**
@@ -628,6 +639,8 @@ static void xilinx_dma_halt(struct xilinx_dma_chan *chan)
 			chan, dma_ctrl_read(chan, XILINX_DMA_REG_STATUS));
 		chan->err = true;
 	}
+
+	chan->idle = true;
 }
 
 /**
@@ -687,14 +700,11 @@ static void xilinx_dma_start_transfer(struct xilinx_dma_chan *chan)
 		dma_ctrl_write(chan, XILINX_DMA_REG_CONTROL, chan->ctrl_reg);
 	}
 
-	if (chan->has_sg && !chan->mcdma)
-#ifdef CONFIG_PHYS_ADDR_T_64BIT
-		dma_ctrl_writeq(chan, XILINX_DMA_REG_CURDESC,
-			       head_desc->async_tx.phys);
-#else
-		dma_ctrl_write(chan, XILINX_DMA_REG_CURDESC,
-			       head_desc->async_tx.phys);
-#endif
+	if (chan->has_sg && !chan->mcdma) {
+		dma_ctrl_write_addr(chan, XILINX_DMA_REG_CURDESC,
+			head_desc->async_tx.phys);
+	}
+
 	if (chan->has_sg && chan->mcdma) {
 		if (head_desc->direction == DMA_MEM_TO_DEV) {
 			dma_ctrl_write(chan, XILINX_DMA_REG_CURDESC,
@@ -717,23 +727,14 @@ static void xilinx_dma_start_transfer(struct xilinx_dma_chan *chan)
 		return;
 
 	/* Start the transfer */
+	chan->idle = false;	
 	if (chan->has_sg && !chan->mcdma) {
 		if (chan->cyclic) {
-#ifdef CONFIG_PHYS_ADDR_T_64BIT
-			dma_ctrl_writeq(chan, XILINX_DMA_REG_TAILDESC,
-					chan->cyclic_seg_p);
-#else
-			dma_ctrl_write(chan, XILINX_DMA_REG_TAILDESC,
-				       chan->cyclic_seg_p);
-#endif
+			dma_ctrl_write_addr(chan, XILINX_DMA_REG_TAILDESC,
+				chan->cyclic_seg_p);
 		} else {
-#ifdef CONFIG_PHYS_ADDR_T_64BIT
-		dma_ctrl_writeq(chan, XILINX_DMA_REG_TAILDESC,
+			dma_ctrl_write_addr(chan, XILINX_DMA_REG_TAILDESC,
 			       tail_segment->phys);
-#else
-		dma_ctrl_write(chan, XILINX_DMA_REG_TAILDESC,
-			       tail_segment->phys);
-#endif
 		}
 	} else if (chan->has_sg && chan->mcdma) {
 
@@ -758,11 +759,8 @@ static void xilinx_dma_start_transfer(struct xilinx_dma_chan *chan)
 					   struct xilinx_dma_tx_segment, node);
 		hw = &segment->hw;
 
-#ifdef CONFIG_PHYS_ADDR_T_64BIT
-		dma_ctrl_writeq(chan, XILINX_DMA_REG_SRCDSTADDR, hw->buf_addr);
-#else
-		dma_ctrl_write(chan, XILINX_DMA_REG_SRCDSTADDR, hw->buf_addr);
-#endif
+		dma_ctrl_write_addr(chan, XILINX_DMA_REG_SRCDSTADDR, hw->buf_addr);
+
 		/* Start the transfer */
 		dma_ctrl_write(chan, XILINX_DMA_REG_BTT,
 			       hw->control & XILINX_DMA_MAX_TRANS_LEN);
@@ -770,7 +768,6 @@ static void xilinx_dma_start_transfer(struct xilinx_dma_chan *chan)
 
 	list_splice_tail_init(&chan->pending_list, &chan->active_list);
 	chan->desc_pendingcount = 0;
-	chan->idle = false;
 }
 
 /**
@@ -946,7 +943,7 @@ append:
  */
 static dma_cookie_t xilinx_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 {
-	struct xilinx_dma_tx_descriptor *desc = to_dma_tx_descriptor(tx);
+	struct xilinx_dma_tx_descriptor *desc = to_xilinx_tx_descriptor(tx);
 	struct xilinx_dma_chan *chan = to_xilinx_chan(tx->chan);
 	dma_cookie_t cookie;
 	unsigned long flags;
@@ -1029,25 +1026,11 @@ xilinx_dma_prep_interleaved(struct dma_chan *dchan,
 
 	/* Fill in the descriptor */
 	if (xt->dir != DMA_MEM_TO_DEV) {
-#ifdef CONFIG_PHYS_ADDR_T_64BIT
-		hw->buf_addr =
-			lower_32_bits(xt->dst_start);
-		hw->buf_addr_msb =
-			upper_32_bits(xt->dst_start);
-#else
-		hw->buf_addr = xt->dst_start;
-#endif
+		hw->buf_addr = xt->dst_start;  
 		hw->mcdma_fields = mm2s_mcdmarx_control(config->ax_cache,
 							config->ax_user);
 	} else {
-#ifdef CONFIG_PHYS_ADDR_T_64BIT
-		hw->buf_addr =
-			lower_32_bits(xt->src_start);
-		hw->buf_addr_msb =
-			upper_32_bits(xt->src_start);
-#else
 		hw->buf_addr = xt->src_start;
-#endif
 		hw->mcdma_fields = mm2s_mcdmatx_control(config->tdest,
 							config->tid,
 							config->tuser,
@@ -1146,15 +1129,7 @@ static struct dma_async_tx_descriptor *xilinx_dma_prep_slave_sg(
 			hw = &segment->hw;
 
 			/* Fill in the descriptor */
-#ifdef CONFIG_PHYS_ADDR_T_64BIT
-			hw->buf_addr =
-				lower_32_bits(sg_dma_address(sg) + sg_used);
-			hw->buf_addr_msb =
-				upper_32_bits(sg_dma_address(sg) + sg_used);
-#else
-			hw->buf_addr = sg_dma_address(sg) + sg_used;
-#endif
-
+			hw->buf_addr = sg_dma_address(sg) + sg_used;    // sg_dma_address(sg) is a dma_addr_t :)			
 			hw->control = copy;
 
 			if (direction == DMA_MEM_TO_DEV) {
@@ -1208,7 +1183,7 @@ static struct dma_async_tx_descriptor *xilinx_dma_prep_dma_cyclic(
 {
 	struct xilinx_dma_chan *chan = to_xilinx_chan(dchan);
 	struct xilinx_dma_tx_descriptor *desc;
-	struct xilinx_dma_tx_segment *segment, *tail_segment;
+	struct xilinx_dma_tx_segment *segment, *tail_segment, *head_segment;
 	size_t copy, sg_used;
 	unsigned int num_periods;
 	int i;
@@ -1245,15 +1220,7 @@ static struct dma_async_tx_descriptor *xilinx_dma_prep_dma_cyclic(
 			copy = min_t(size_t, period_len - sg_used,
 				     XILINX_DMA_MAX_TRANS_LEN);
 			hw = &segment->hw;
-
-#ifdef CONFIG_PHYS_ADDR_T_64BIT
-			hw->buf_addr = lower_32_bits(buf_addr + sg_used +
-						     (period_len * i));
-			hw->buf_addr_msb = upper_32_bits(buf_addr + sg_used +
-							 (period_len * i));
-#else
 			hw->buf_addr = buf_addr + sg_used + (period_len*i);
-#endif
 			hw->control = copy;
 
 			sg_used += copy;
@@ -1266,26 +1233,27 @@ static struct dma_async_tx_descriptor *xilinx_dma_prep_dma_cyclic(
 		}
 	}
 
-	segment = list_first_entry(&desc->segments,
-				   struct xilinx_dma_tx_segment, node);
-	desc->async_tx.phys = segment->phys;
+	head_segment = list_first_entry(&desc->segments,
+					struct xilinx_dma_tx_segment, node);
+	desc->async_tx.phys = head_segment->phys;
 	desc->cyclic = true;
 	chan->ctrl_reg |= XILINX_DMA_CR_CYCLIC_BD_EN_MASK;
 	dma_ctrl_write(chan, XILINX_DMA_REG_CONTROL, chan->ctrl_reg);
 
 	tail_segment = list_last_entry(&desc->segments,
-				       struct xilinx_dma_tx_segment,
-				       node);
-	/* For the last DMA_MEM_TO_DEV transfer, set EOP */
+					struct xilinx_dma_tx_segment, node);
+	tail_segment->hw.next_desc = head_segment->phys;
+
+	/* Set SOP (start of packet) for first transfer (head), and
+	 * set EOP (end of packet) for the last transfer (tail), but 
+	 * this is only needed when in DMA_MEM_TO_DEV mode. */
 	if (direction == DMA_MEM_TO_DEV) {
-		segment->hw.control |= XILINX_DMA_BD_SOP;
+		head_segment->hw.control |= XILINX_DMA_BD_SOP;
 		tail_segment->hw.control |= XILINX_DMA_BD_EOP;
 	}
 
-	tail_segment->hw.next_desc = (u32)segment->phys;
-#ifdef CONFIG_PHYS_ADDR_T_64BIT
-	tail_segment->hw.next_desc_msb = upper_32_bits(segment->phys);
-#endif
+	/* Loop-back the tail transfer to the head transfer. */
+	tail_segment->hw.next_desc = head_segment->phys;
 
 	return &desc->async_tx;
 
@@ -1620,5 +1588,6 @@ static struct platform_driver xilinx_dma_driver = {
 module_platform_driver(xilinx_dma_driver);
 
 MODULE_AUTHOR("Xilinx, Inc.");
+MODULE_AUTHOR("Ping DSP, Inc.");
 MODULE_DESCRIPTION("Xilinx DMA driver");
 MODULE_LICENSE("GPL");
