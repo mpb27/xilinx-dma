@@ -640,16 +640,17 @@ static void xilinx_dma_start(struct xilinx_dma_chan *chan)
 	int err = 0;
 	u32 val;
 	
+	/* Set the RUN bit in DMA Control Register. */
 	dma_ctrl_set(chan, XILINX_DMA_REG_CONTROL, XILINX_DMA_CR_RUNSTOP_MASK);
 
-	/* Wait for the hardware to start */
+	/* Wait for the hardware to start.  HALTED bit must go low in the Status Register. */
 	err = xilinx_dma_poll_timeout(chan, XILINX_DMA_REG_STATUS, val,   // poll register
 				      !(val & XILINX_DMA_SR_HALTED_MASK), // exit condition
 				      1, XILINX_DMA_LOOP_COUNT);          // loop delay and timeout
 
 	if (err) {
-		dev_err(chan->dev, "Cannot start channel %p: %x\n",
-			 chan, dma_ctrl_read(chan, XILINX_DMA_REG_STATUS));
+		dev_err(chan->dev, "Cannot start channel %s (%p) : SR = %x\n",
+			chan->name, chan, dma_ctrl_read(chan, XILINX_DMA_REG_STATUS));
 		chan->err = true;
 	}
 }
@@ -688,20 +689,26 @@ static void xilinx_dma_start_transfer(struct xilinx_dma_chan *chan)
 	}
 
 	if (chan->has_sg && !chan->mcdma) {
+		/* Setup the CURRDESC_PTR in hardware to the first (head) transaction descriptor.
+		 *
+		 * Note: This does not initiate the DMA, it only tells it where to start, 
+		 *       writing to TAILDESC_PTR initiates SG DMA.   The DMA hardware must be halted
+		 *       to write this register (DMACR.RS=0 and DMASR.Halted=1).
+		 */
 		dma_ctrl_write_addr(chan, XILINX_DMA_REG_CURDESC,
 			head_desc->async_tx.phys);
 	}
 
 	if (chan->has_sg && chan->mcdma) {
 		if (chan->direction == DMA_MEM_TO_DEV) {
-			dma_ctrl_write(chan, XILINX_DMA_REG_CURDESC,  // shouldnt these be write addr, ie 32 vs 64 bit?
-				       head_desc->async_tx.phys);
+			dma_ctrl_write_addr(chan, XILINX_DMA_REG_CURDESC,
+				head_desc->async_tx.phys);
 		} else {
 			if (!config->tdest) {
-				dma_ctrl_write(chan, XILINX_DMA_REG_CURDESC,
+				dma_ctrl_write_addr(chan, XILINX_DMA_REG_CURDESC,
 				       head_desc->async_tx.phys);
 			} else {
-				dma_ctrl_write(chan,
+				dma_ctrl_write_addr(chan,
 					XILINX_DMA_MCRX_CDESC(config->tdest),
 				       head_desc->async_tx.phys);
 			}
@@ -720,6 +727,8 @@ static void xilinx_dma_start_transfer(struct xilinx_dma_chan *chan)
 			dma_ctrl_write_addr(chan, XILINX_DMA_REG_TAILDESC,
 				chan->cyclic_seg_p);
 		} else {
+			/* Write the pointer to last transaction descriptor to the TAILDESC_PTR in hardware,
+			 * which initiates the SG DMA. */
 			dma_ctrl_write_addr(chan, XILINX_DMA_REG_TAILDESC,
 			       tail_segment->phys);
 		}
@@ -774,6 +783,8 @@ static void xilinx_dma_issue_pending(struct dma_chan *dchan)
 /**
  * xilinx_dma_complete_descriptor - Mark the active descriptor as complete
  * @chan : xilinx DMA channel
+ *
+ * Context: IRQ Handler
  */
 static void xilinx_dma_complete_descriptor(struct xilinx_dma_chan *chan)
 {
@@ -842,8 +853,9 @@ static irqreturn_t xilinx_dma_irq_handler(int irq, void *data)
 
 	if (status & XILINX_DMA_XR_IRQ_ERROR_MASK) {
 		dev_err(chan->dev,
-			"Channel %p has errors %x cdr %x cdr msb %x tdr %x tdr msb %x",
-			chan, dma_ctrl_read(chan, XILINX_DMA_REG_STATUS),
+			"Channel %s (%p) has errors %x cdr %x cdr msb %x tdr %x tdr msb %x.\n",
+			chan->name, chan,
+			dma_ctrl_read(chan, XILINX_DMA_REG_STATUS),
 			dma_ctrl_read(chan, XILINX_DMA_REG_CURDESC),
 			dma_ctrl_read(chan, XILINX_DMA_REG_CURDESCMSB),
 			dma_ctrl_read(chan, XILINX_DMA_REG_TAILDESC),
@@ -858,6 +870,9 @@ static irqreturn_t xilinx_dma_irq_handler(int irq, void *data)
 	if (status & XILINX_DMA_XR_IRQ_DELAY_MASK)
 		dev_dbg(chan->dev, "Inter-packet latency too long\n");
 
+	/*
+	 * Check if Interrupt on Complete (IOC) has occured.
+	 */
 	if (status & XILINX_DMA_XR_IRQ_IOC_MASK) {
 		spin_lock(&chan->lock);
 		xilinx_dma_complete_descriptor(chan);
