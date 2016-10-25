@@ -12,7 +12,7 @@ endif
 KERNEL_BUILD:=$(PROOT)/build/$(LINUX_KERNEL)
 
 LOCALPWD=$(shell pwd)
-obj-m += xilinx_dma.o
+obj-m += xilinx_dma_sg.o
 
 all: build modules install
 
