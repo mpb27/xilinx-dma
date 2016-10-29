@@ -40,8 +40,6 @@
 static unsigned cached_buffers = 0;
 module_param(cached_buffers, int, S_IRUGO);
 
-MODULE_LICENSE("GPL");
-
 #define DRIVER_NAME 		"dma_proxy"
 #define CHANNEL_COUNT 		2
 #define ERROR 			-1
@@ -66,7 +64,7 @@ struct dma_proxy_channel {
 	dma_cookie_t cookie;
 	dma_addr_t dma_handle;
 	u32 direction;						/* DMA_MEM_TO_DEV or DMA_DEV_TO_MEM */
-	
+
 	struct dma_async_tx_descriptor *tx_desc;
 };
 
@@ -100,12 +98,12 @@ static dma_cookie_t start_transfer(struct dma_proxy_channel *pchannel_p)
 	/* Create a buffer (channel)  descriptor for the buffer since only a
 	 * single buffer is being used for this transfer
 	 */
-	tx_desc = dmaengine_prep_slave_single(pchannel_p->channel_p, pchannel_p->dma_handle,
-											interface_p->length,
-											pchannel_p->direction,
-											flags);
+	tx_desc = dmaengine_prep_slave_single(pchannel_p->channel_p,
+		pchannel_p->dma_handle, interface_p->length,
+		pchannel_p->direction, flags);
+
 	pchannel_p->tx_desc = tx_desc;
-	
+
 	/* Make sure the operation was completed successfully
 	 */
 	if (!tx_desc) {
@@ -214,9 +212,9 @@ static void transfer(struct dma_proxy_channel *pchannel_p)
 		else
 			map_direction = DMA_FROM_DEVICE;
 		pchannel_p->dma_handle = dma_map_single(pchannel_p->dma_device_p,
-												interface_p->buffer,
-												interface_p->length,
-												map_direction);
+							interface_p->buffer,
+							interface_p->length,
+							map_direction);
 	} else {
 
 		/* The physical address of the buffer in the interface is needed for the dma transfer
@@ -303,9 +301,9 @@ static int mmap(struct file *file_p, struct vm_area_struct *vma)
 	 */
 	if (cached_buffers) {
 		if (remap_pfn_range(vma, vma->vm_start,
-							virt_to_phys((void *)pchannel_p->interface_p)>>PAGE_SHIFT,
-							vma->vm_end - vma->vm_start, vma->vm_page_prot))
-			return -EAGAIN;
+			virt_to_phys((void *)pchannel_p->interface_p)>>PAGE_SHIFT,
+			vma->vm_end - vma->vm_start, vma->vm_page_prot))
+				return -EAGAIN;
 		return 0;
 	} else
 
@@ -313,8 +311,8 @@ static int mmap(struct file *file_p, struct vm_area_struct *vma)
 		 * user space application can use it
 		 */
 		return dma_common_mmap(pchannel_p->dma_device_p, vma,
-							   pchannel_p->interface_p, pchannel_p->interface_phys_addr,
-							   vma->vm_end - vma->vm_start);
+				pchannel_p->interface_p, pchannel_p->interface_phys_addr,
+				vma->vm_end - vma->vm_start);
 }
 
 /* Open the device file and set up the data pointer to the proxy channel data for the
@@ -409,22 +407,23 @@ static int cdevice_init(struct dma_proxy_channel *pchannel_p, char *name)
 	 */
 	strcat(device_name, name);
 	pchannel_p->proxy_device_p = device_create(pchannel_p->class_p, NULL,
-											   pchannel_p->dev_node, NULL, device_name);
+		pchannel_p->dev_node, NULL, device_name);
 
 	if (IS_ERR(pchannel_p->proxy_device_p)) {
 		dev_err(pchannel_p->dma_device_p, "unable to create the device\n");
+		rc = PTR_ERR(pchannel_p->proxy_device_p);
 		goto init_error3;
 	}
 
 	return 0;
 
-init_error3:
+    init_error3:
 	class_destroy(pchannel_p->class_p);
 
-init_error2:
+    init_error2:
 	cdev_del(&pchannel_p->cdev);
 
-init_error1:
+    init_error1:
 	unregister_chrdev_region(pchannel_p->dev_node, 1);
 	return rc;
 }
@@ -437,7 +436,7 @@ static void cdevice_exit(struct dma_proxy_channel *pchannel_p, int last_channel)
 	/* Take everything down in the reverse order
 	 * from how it was created for the char device
 	 */
-	if (pchannel_p->proxy_device_p) {
+	if (!IS_ERR(pchannel_p->proxy_device_p)) {
 		device_destroy(pchannel_p->class_p, pchannel_p->dev_node);
 		if (last_channel)
 			class_destroy(pchannel_p->class_p);
@@ -447,26 +446,15 @@ static void cdevice_exit(struct dma_proxy_channel *pchannel_p, int last_channel)
 	}
 }
 
-static int filter_hack = 0;
-static bool filter(struct dma_chan* chan, void* param) {
-	filter_hack++;
-	//printk("Filter Hack : %d \n", filter_hack);
-	//printk("  chan           : %x \n", chan);
-	//printk("  chan->private  : %x \n", chan->private);
-	//if (chan->private)
-	//	printk("  *chan->private  : %x \n", *((int*)chan->private) );
-
-	// if (filter_hack == 9 && direction == DMA_MEM_TO_DEV) return true;
-        // else if (filter_hack == 10 && direction == DMA_DEV_TO_MEM) return true;
-        // else return false;
-
-	// AXI-DMA doesn't have chan->private pointing to a proper address
-        // so return false if it is pointing.
-	if (chan->private) return false;
-	//printk("  RETURN TRUE \n");
-	return true;
+static bool filter(struct dma_chan* dchan, void* param) {
+	const u32 XILINX_DMA_PERIPHERAL_ID = 0x000A3500;
+        const u32 match = XILINX_DMA_PERIPHERAL_ID | *((u32*)param);
+        u32 *peri_id = dchan->private;
+	pr_info("dchan->private = %x\n", peri_id);
+	if (peri_id != NULL) pr_info("*dchan->private = %x\n", *peri_id);
+        return (peri_id != NULL && (*peri_id == match));
 }
-	
+
 
 /* Create a DMA channel by getting a DMA channel from the DMA Engine and then setting
  * up the channel as a character device to allow user space control.
@@ -485,13 +473,9 @@ static int create_channel(struct dma_proxy_channel *pchannel_p, char *name, u32 
 	/* Request the DMA channel from the DMA engine and then use the device from
 	 * the channel for the proxy channel also.
 	 */
-	// old: pchannel_p->channel_p = dma_request_channel(mask, NULL, NULL);
-        // new1: pchannel_p->channel_p = dma_request_slave_channel(
-        // new hack:
-        filter_hack = 0;
         pchannel_p->channel_p = dma_request_channel(mask, filter, &direction);
 	if (!pchannel_p->channel_p) {
-		dev_err(pchannel_p->dma_device_p, "DMA channel request error\n");
+		pr_err("dma_proxy: DMA channel request error\n");
 		return ERROR;
 	}
 	pchannel_p->dma_device_p = &pchannel_p->channel_p->dev->device;
