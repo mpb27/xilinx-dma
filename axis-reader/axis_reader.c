@@ -1,5 +1,33 @@
-/*  axis-reader.c - The simplest kernel module.
+/*
+ * AXI4-Stream Reader character device driver for Xilinx DMA S2MM driver.
+ *
+ * Copyright (C) 2016 Ping DSP, Inc.
+ *
+ * Description:
+ *  This driver creates a character device (/dev/axisreader0) that can be used
+ *  to read complete AXI4-Stream packets.  It uses an S2MM (DMA_DEV_TO_MEM)
+ *  channel provided by the xilinx-dma-dr DMA driver and creates a 4 packet
+ *  circular buffer.  The maximum packet length is specified in bytes by the
+ *  max_packet_length parameter.  The driver automatically finds the first
+ *  available (not requested / taken by some other kernel module) S2MM channel
+ *  and creates /dev/axisreader0.
+ *
+ * Example usage (Python):
+ *   ar0 = os.open("/dev/axisreader0", os.O_RDONLY)
+ *   data = os.read(ar0, 1024*1024)
+ *   if len(data) == 0:
+ *       print("No AXI4-Stream packet available.")
+ *   else:
+ *       print("Got AXI4-Stream packet of length %d." % len(data))
+ *   os.close(ar0)
+ *
+ * License:
+ *  This is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
  */
+
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
@@ -11,13 +39,14 @@
 #include <linux/workqueue.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
+#include <linux/uaccess.h>
 
 #define IS_NULL(x) (x == NULL)
 #define DRIVER_NAME "axis-reader"
 
 /* Simple example of how to receive command line parameters to your module.
    Delete if you don't need them */
-int max_packet_length = 3*1024*1024;
+int max_packet_length = 1*1024*1024;
 
 module_param(max_packet_length, int, S_IRUGO);
 
@@ -282,6 +311,7 @@ static int list_count(struct list_head *head) {
 
 static int arf_open(struct inode *ino, struct file *file)
 {
+        unsigned long flags;
         struct ar_transaction *tx1, *tx2;
         struct ar_channel *ch = container_of(ino->i_cdev, struct ar_channel, char_device);
 
@@ -291,18 +321,20 @@ static int arf_open(struct inode *ino, struct file *file)
         if (list_count(&ch->free_transactions) < 2)  {
                 dev_err(ch->dev_entry, "Could not open() because there aren't"
                         " 2 free transactions.\n");
-                return -EIO;
+                return -EFAULT;
         }
 
         // TODO: improve this code, add more error checking.
 
         /* Move 2 transactions from free to pending list. */
+        spin_lock_irqsave(&ch->lock, flags);
         tx1 = list_first_entry_or_null(&ch->free_transactions,
                         struct ar_transaction, node);
         list_move_tail(&tx1->node, &ch->pending_transactions);
         tx2 = list_first_entry_or_null(&ch->free_transactions,
                         struct ar_transaction, node);
         list_move_tail(&tx2->node, &ch->pending_transactions);
+        spin_unlock_irqrestore(&ch->lock, flags);
 
         /* Start transactions. */
         ar_transaction_submit(tx1);
@@ -316,6 +348,7 @@ static int arf_open(struct inode *ino, struct file *file)
 
 static int arf_release(struct inode *ino, struct file *file)
 {
+        unsigned long flags;
         //struct ar_channel *ch = container_of(ino->i_cdev, struct ar_channel, char_device);
         struct ar_channel *ch = file->private_data;
         struct ar_transaction *tx, *next;
@@ -326,6 +359,7 @@ static int arf_release(struct inode *ino, struct file *file)
         // Stop transcting, move completed and pending back to free.
         ar_transactions_stop(ch);
 
+        spin_lock_irqsave(&ch->lock, flags);
         list_for_each_entry_safe(tx, next, &ch->pending_transactions, node) {
                 list_move_tail(&tx->node, &ch->free_transactions);
         }
@@ -333,17 +367,70 @@ static int arf_release(struct inode *ino, struct file *file)
         list_for_each_entry_safe(tx, next, &ch->completed_transactions, node) {
                 list_move_tail(&tx->node, &ch->free_transactions);
         }
+        spin_unlock_irqrestore(&ch->lock, flags);
 
         return 0;
 }
 
 
+static ssize_t arf_read(struct file *file, char *buffer, size_t len, loff_t *fpos)
+{
+        int remain;
+        unsigned long flags, txlen;
+        size_t offset = fpos ? *fpos : 0;
+        struct ar_channel *ch = file->private_data;
+        struct ar_transaction *tx = NULL;
+
+        /* Take a completed transaction and remove it from the completed list.
+         */
+        spin_lock_irqsave(&ch->lock, flags);
+        tx = list_first_entry_or_null(&ch->completed_transactions,
+                        struct ar_transaction, node);
+        if (!tx) {
+                spin_unlock_irqrestore(&ch->lock, flags);
+                //return -EAGAIN;    /* No transaction available. */
+                return 0;
+        }
+        list_del(&tx->node);
+        spin_unlock_irqrestore(&ch->lock, flags);
+
+        txlen = tx->dma_completed_len;
+
+        /* Check that there is enough space in the user buffer for transaction.
+         */
+        if ((len - offset) < txlen) {
+                /* Not enough space, move the transaction to free. */
+                spin_lock_irqsave(&ch->lock, flags);
+                list_add(&tx->node, &ch->free_transactions);
+                spin_unlock_irqrestore(&ch->lock, flags);
+                ch->status_error++;
+                return -EINVAL;    /* Transaciton larger than the buffer provided. */
+                                   /* TODO: Enable partial reads. */
+        }
+
+        /* Copy transaction data to the user buffer.
+         */
+        remain = copy_to_user(&buffer[offset], tx->dma_buffer, txlen);
+
+        /* Done using the transaction, we can now move it to the free transactions.
+         */
+        spin_lock_irqsave(&ch->lock, flags);
+        list_add(&tx->node, &ch->free_transactions);
+        spin_unlock_irqrestore(&ch->lock, flags);
+
+        if (remain != 0) {
+                return -EIO;
+        }
+
+        return txlen;
+}
+
 static struct file_operations arf_fileops = {
         .owner          = THIS_MODULE,
         .open           = arf_open,             ///< takes 2 or more transactions from teh free transaction list and places them in the pending list and starts them
-        .release        = arf_release           ///< terminates DMA and takes all transactions and places them in the free transaction list
+        .release        = arf_release,          ///< terminates DMA and takes all transactions and places them in the free transaction list
         //.unlocked_ioctl = arf_ioctl
-        //.read           = arf_read
+        .read           = arf_read
 };
 
 static int ar_chardev_create(struct ar_channel* chan)
