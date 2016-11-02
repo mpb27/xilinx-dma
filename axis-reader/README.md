@@ -1,0 +1,2 @@
+## AXI4-Stream Reader character device driver for Xilinx DMA driver.
+This driver creates a character device (/dev/axisreader0) that can be used to read complete AXI4-Stream packets.  It uses an S2MM (DMA_DEV_TO_MEM) channel provided by the **xilinx-dma-dr** DMA driver and creates a 4 packet circular buffer.  The maximum packet length is specified in bytes by the max_packet_length parameter.  The driver automatically finds the first available (not requested / taken by some other kernel module) S2MM channel and creates /dev/axisreader0.
