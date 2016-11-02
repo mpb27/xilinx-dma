@@ -666,12 +666,39 @@ static irqreturn_t xilinx_dma_irq_handler(int irq, void *data)
 			dma_ctrl_read(chan, XILINX_DMA_REG_CONTROL),
 			dma_ctrl_read(chan, XILINX_DMA_REG_STATUS));
 		chan->status = CHAN_ERROR;
+		return IRQ_HANDLED;
 	}
 
 	/* Check if Interrupt on Complete (IOC) has occured.
 	 */
 	if (status & XILINX_DMA_XR_IRQ_IOC_MASK) {
 		struct xilinx_dma_tx_descriptor *at = chan->active_transaction;
+
+		/* Check that there is an active transaction. */
+		if (!at) {
+			/* This is caused by the way terminate_all() is implemented
+			 * and the Xilinx DMA soft IP core's halt mechanism.
+			 * Terminate all tells the HW core to halt, and frees
+			 * all of the descriptors (active, pending and completed).
+			 * But the HW core will not halt until after the active
+			 * transaction is completed, and since we cannot guarentee
+			 * there will be one, we cannot wait for this to occur.
+			 *
+			 * There is a potential danger here:
+			 * If the client calls terminate_all() and then frees
+			 * the DMA buffer backing the active transaction, the
+			 * HW core will still try to complete the active transaction.
+			 * In order to prevent this, the DMA core needs to be
+			 * reset in terminate_all() but that resets BOTH the
+			 * channels! FUBAR.
+			 *
+			 * Fortunately, my axis-reader module does not free DMA
+			 * buffers unless it is being unloaded.
+			 */
+			dev_err(chan->dev, "Channel %s fired interrupt without "
+				"an active transaction!\n", chan->name);
+			return IRQ_HANDLED;
+		}
 
 		/* Update the transferred number of bytes. */
 		at->transferred_length = dma_ctrl_read(chan, XILINX_DMA_REG_BTT);
