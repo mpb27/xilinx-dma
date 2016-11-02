@@ -40,6 +40,7 @@
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 
 #define IS_NULL(x) (x == NULL)
 #define DRIVER_NAME "axis-reader"
@@ -68,6 +69,7 @@ struct ar_channel
 {
         bool is_open;
         spinlock_t lock;
+        wait_queue_head_t wait_completed;
 
         /* DMA */
         struct dma_chan *dma;                    ///< DMA channel.
@@ -151,6 +153,11 @@ static void ar_transaction_callback(void *transaction)
          * to the completed list.
          */
         list_move_tail(&tx->node, &ch->completed_transactions);
+
+        /* Wake up anyone waiting on the next completed transaction.
+         * Typically this would be user code blocking in arf_read().
+         */
+        wake_up_interruptible(&ch->wait_completed);
 
         /* Every time a transactionsction completes, submit a new one by
          * moving one from either the free transactions list or if not
@@ -375,23 +382,54 @@ static int arf_release(struct inode *ino, struct file *file)
 
 static ssize_t arf_read(struct file *file, char *buffer, size_t len, loff_t *fpos)
 {
-        int remain;
+        long remain, ret;
         unsigned long flags, txlen;
         size_t offset = fpos ? *fpos : 0;
         struct ar_channel *ch = file->private_data;
         struct ar_transaction *tx = NULL;
 
-        /* Take a completed transaction and remove it from the completed list.
+        /* Pattern is from http://stackoverflow.com/a/23493619/953414
+         * Also see http://www.makelinux.net/ldd3/chp-6-sect-2
          */
         spin_lock_irqsave(&ch->lock, flags);
-        tx = list_first_entry_or_null(&ch->completed_transactions,
-                        struct ar_transaction, node);
-        if (!tx) {
+        while (list_empty(&ch->completed_transactions)) {
+
+                /* Unlock while waiting, or if non-blocking. */
                 spin_unlock_irqrestore(&ch->lock, flags);
-                //return -EAGAIN;    /* No transaction available. */
-                return 0;
+
+                if (file->f_flags & O_NONBLOCK) {
+                        /* No completed transaction, and non-blocking read so
+                         * exit returning either 0 or -EAGAIN.
+                         * Ref: http://www.xml.com/ldd/chapter/book/ch05.html#t3
+                         */
+                        return -EAGAIN;
+                }
+
+                /* Wait for a completed transaction to be added to the list.
+                 */
+                ret = wait_event_interruptible(ch->wait_completed,
+                        !list_empty(&ch->completed_transactions));
+
+                if (ret) {
+                        dev_err(ch->dev_entry, "Blocking read() interrupted %ld.\n",
+                                ret);
+                        return -EFAULT;
+                }
+
+                /* Lock again for the while check, and if we exit the
+                 * while loop, the list will be locked.
+                 */
+                spin_lock_irqsave(&ch->lock, flags);
         }
+
+        /* A completed transaction is now available.  Get it and remove it.
+         */
+        tx = list_first_entry(&ch->completed_transactions,
+                struct ar_transaction, node);
         list_del(&tx->node);
+
+        /* Unlock for the copy and other checks.
+         */
         spin_unlock_irqrestore(&ch->lock, flags);
 
         txlen = tx->dma_completed_len;
@@ -429,7 +467,6 @@ static struct file_operations arf_fileops = {
         .owner          = THIS_MODULE,
         .open           = arf_open,             ///< takes 2 or more transactions from teh free transaction list and places them in the pending list and starts them
         .release        = arf_release,          ///< terminates DMA and takes all transactions and places them in the free transaction list
-        //.unlocked_ioctl = arf_ioctl
         .read           = arf_read
 };
 
@@ -546,6 +583,7 @@ static int ar_channel_init(struct ar_channel* chan)
         chan->is_open = false;
 
         spin_lock_init(&chan->lock);
+        init_waitqueue_head(&chan->wait_completed);
         INIT_LIST_HEAD(&chan->free_transactions);
         INIT_LIST_HEAD(&chan->pending_transactions);
         INIT_LIST_HEAD(&chan->completed_transactions);
