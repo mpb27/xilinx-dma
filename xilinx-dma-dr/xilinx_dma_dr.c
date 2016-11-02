@@ -314,6 +314,7 @@ static void xilinx_dma_free_descriptors(struct xilinx_dma_chan *chan)
 	xilinx_dma_free_desc_list(chan, &chan->pending_transactions);
 	xilinx_dma_free_desc_list(chan, &chan->completed_transactions);
 	xilinx_dma_free_tx_descriptor(chan, chan->active_transaction);
+	chan->active_transaction = NULL;
 
 	spin_unlock_irqrestore(&chan->lock, flags);
 }
@@ -405,15 +406,23 @@ static void xilinx_dma_hw_halt(struct xilinx_dma_chan *chan)
 
 	dma_ctrl_clear(chan, XILINX_DMA_REG_CONTROL, XILINX_DMA_CR_RUNSTOP_MASK);
 
-	/* Wait for the hardware to halt */
+	/* Wait for the hardware to halt.
+	 *
+	 * FIXME: This is a problem at the moment because the Xilinx AXI DMA
+	 *        S2MM hardware does not assert HALTED if there is no AXI-Stream
+	 *        data available.  For now, just warn and ignore.
+	 *
+	 *        One fix would be to issue a reset of the core when we want to
+	 *        halt it, however that resets both the S2MM and MM2S channels!
+	 */
+
 	err = xilinx_dma_poll_timeout(chan, XILINX_DMA_REG_STATUS, val,
-				      (val & XILINX_DMA_SR_HALTED_MASK), 1,
+				      (val & XILINX_DMA_SR_HALTED_MASK), 0,
 				      XILINX_DMA_LOOP_COUNT);
 
 	if (err) {
-		dev_err(chan->dev, "Cannot stop channel %p: %x\n",
-			chan, dma_ctrl_read(chan, XILINX_DMA_REG_STATUS));
-		chan->status = CHAN_ERROR;
+		dev_warn(chan->dev, "Cannot stop channel %s : SR = %x\n",
+			chan->name, dma_ctrl_read(chan, XILINX_DMA_REG_STATUS));
 	}
 
 	chan->status = CHAN_IDLE;
@@ -440,6 +449,7 @@ static void xilinx_dma_hw_start(struct xilinx_dma_chan *chan)
 		dev_err(chan->dev, "Cannot start channel %s (%p) : SR = %x\n",
 			chan->name, chan, dma_ctrl_read(chan, XILINX_DMA_REG_STATUS));
 		chan->status = CHAN_ERROR;
+		return;
 	}
 
 	chan->status = CHAN_IDLE;
@@ -1127,6 +1137,7 @@ static int xilinx_dma_remove(struct platform_device *pdev)
 		if (xdev->chan[i])
 			xilinx_dma_chan_remove(xdev->chan[i]);
 
+	dev_info(&pdev->dev, "module exited\n");
 	return 0;
 }
 
