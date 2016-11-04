@@ -15,3 +15,25 @@
    3. Check if the DMA max length is actually 23 bits, and/or detect it and use that as the max.
    4. 
 
+# Links of note
+
+### Xilinx Forum DMA posts
+- https://forums.xilinx.com/t5/Embedded-Linux/AXI-DMA-request-channel-problem/td-p/678801
+- https://forums.xilinx.com/t5/Embedded-Linux/AXIDMA-test-issue/td-p/729873
+
+
+### Xilinx GitHub
+- https://github.com/Xilinx/linux-xlnx/pull/92
+- https://github.com/Xilinx/linux-xlnx/pull/76
+
+### Xilinx Linux / DMA Presentation PDFs and Webcasts
+- https://forums.xilinx.com/xlnx/attachments/xlnx/ELINUX/10658/1/drivers-session4-dma-4public.pdf
+- http://www.xilinx.com/video/soc/linux-device-drivers-part-2-platform-character-drivers.html
+
+### Linux Device Drivers (programming)
+- http://www.xml.com/ldd/chapter/book/ch05.html#t3
+- https://linux.die.net/man/2/select
+- http://static.lwn.net/images/pdf/LDD3/ch03.pdf
+- http://www.makelinux.net/ldd3/chp-3-sect-9
+- https://www.kernel.org/doc/Documentation/printk-formats.txt
+- http://www.makelinux.net/ldd3/chp-6-sect-2
