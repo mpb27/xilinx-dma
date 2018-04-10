@@ -26,6 +26,10 @@
  *  it under the terms of the GNU General Public License as published by
  *  the Free Software Foundation; either version 2 of the License, or
  *  (at your option) any later version.
+ *
+ * References:
+ *   - https://stackoverflow.com/a/34032364/953414
+ *
  */
 
 #include <linux/kernel.h>
@@ -41,6 +45,9 @@
 #include <linux/dma-mapping.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <linux/poll.h>
+#include <linux/ioctl.h>
+#include <asm/ioctls.h>
 
 #define IS_NULL(x) (x == NULL)
 #define DRIVER_NAME "axis-reader"
@@ -167,10 +174,11 @@ static void ar_transaction_callback(void *transaction)
         if (unlikely(list_empty(&ch->free_transactions))) {
                 /* We don't have a free transaction.  We need to get one from
                  * the completed transactions, and increment status.
+                 * We will be getting the 2nd completed transaction (not first)
+                 * so check that the list is not empty and not singular.
                  */
-                tx_next = list_first_entry_or_null(&ch->completed_transactions,
-                                        struct ar_transaction, node);
-                if (!tx_next) {
+                if (list_empty(&ch->completed_transactions) 
+                    || list_is_singular(&ch->completed_transactions)) {
                         /* Something has gone horribly wrong, there are no
                          * completed or free tranasctions!
                          */
@@ -179,6 +187,14 @@ static void ar_transaction_callback(void *transaction)
                         ch->status_error++;
                         return;
                 }
+
+                /* Take the 2nd entry in the completed transactions list because
+                 * the first's length may have been returned using ioctl to the user.
+                 */
+                tx_next = list_first_entry(&ch->completed_transactions, 
+                        struct ar_transaction, node);
+                tx_next = list_next_entry(tx_next, node);
+
                 ch->status_dropped++;
                 ch->status_dropped_bytes += tx_next->dma_completed_len;
         } else {
@@ -206,15 +222,14 @@ static void ar_transaction_callback(void *transaction)
                  * transaction list.
                  */
                  spin_lock_irqsave(&ch->lock, flags);
-                 list_move_tail(&tx->node, &ch->free_transactions);
+                 list_move_tail(&tx_next->node, &ch->free_transactions);
                  spin_unlock_irqrestore(&ch->lock, flags);
                  ch->status_error++;
+                 return;
         }
 
         ar_transactions_start(tx_next->channel);
 }
-
-
 
 static struct ar_transaction * ar_transaction_create(struct ar_channel* chan)
 {
@@ -422,29 +437,32 @@ static ssize_t arf_read(struct file *file, char *buffer, size_t len, loff_t *fpo
                 spin_lock_irqsave(&ch->lock, flags);
         }
 
-        /* A completed transaction is now available.  Get it and remove it.
+        /* A completed transaction is available.  Get it but don't remove it yet.
          */
         tx = list_first_entry(&ch->completed_transactions,
                 struct ar_transaction, node);
+
+        /* Check that there is enough space in the user buffer for transaction.
+         */
+        txlen = tx->dma_completed_len;        
+        if ((len - offset) < txlen) {
+                /* Not enough space, we haven't moved the transaction so we can just
+                 * unlock and return an error code.  This is not an error in the driver
+                 * so no need to increment any error codes.
+                 */
+                spin_unlock_irqrestore(&ch->lock, flags);
+                return -EINVAL;    /* Transaciton larger than the buffer provided. */
+                                   /* TODO: Enable partial reads. */
+        }
+
+        /* We can now safely remove the transaction from the completed list because
+         * we know if will fit in the user space buffer.
+         */
         list_del(&tx->node);
 
         /* Unlock for the copy and other checks.
          */
         spin_unlock_irqrestore(&ch->lock, flags);
-
-        txlen = tx->dma_completed_len;
-
-        /* Check that there is enough space in the user buffer for transaction.
-         */
-        if ((len - offset) < txlen) {
-                /* Not enough space, move the transaction to free. */
-                spin_lock_irqsave(&ch->lock, flags);
-                list_add(&tx->node, &ch->free_transactions);
-                spin_unlock_irqrestore(&ch->lock, flags);
-                ch->status_error++;
-                return -EINVAL;    /* Transaciton larger than the buffer provided. */
-                                   /* TODO: Enable partial reads. */
-        }
 
         /* Copy transaction data to the user buffer.
          */
@@ -457,17 +475,65 @@ static ssize_t arf_read(struct file *file, char *buffer, size_t len, loff_t *fpo
         spin_unlock_irqrestore(&ch->lock, flags);
 
         if (remain != 0) {
+                /* Should never fail.
+                 */
+                ch->status_error++;
                 return -EIO;
         }
 
         return txlen;
 }
 
+static unsigned int arf_poll(struct file *file, poll_table *wait)
+{
+    unsigned int ret = 0;
+    unsigned long flags;
+    struct ar_channel *ch = file->private_data;
+
+    /* Add our wait queue (wait_completed) to the poll table for the kernel to use for wake up. */
+    poll_wait(file, &ch->wait_completed, wait);
+
+    /* If the completed transaction list is not empty, then a read will not block, data is available. */
+    spin_lock_irqsave(&ch->lock, flags);
+    if (!list_empty(&ch->completed_transactions)) {
+        ret |= POLLIN | POLLRDNORM;
+    }
+    spin_unlock_irqrestore(&ch->lock, flags);
+
+    return ret;
+}
+
+// Kernel 2.6.35+ simplified the ioctl interface:
+// https://lwn.net/Articles/119652/
+// http://opensourceforu.com/2011/08/io-control-in-linux/
+static long arf_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    unsigned int nextTxLength;
+    unsigned long flags;
+    struct ar_transaction *tx = NULL;
+    struct ar_channel *ch = file->private_data;
+
+    switch (cmd) {
+
+    case FIONREAD:        
+        spin_lock_irqsave(&ch->lock, flags);
+        tx = list_first_entry_or_null(&ch->completed_transactions, struct ar_transaction, node);        
+        spin_unlock_irqrestore(&ch->lock, flags);        
+        nextTxLength = (tx != NULL) ? tx->dma_completed_len : 0;
+        copy_to_user((void*)arg, &nextTxLength, sizeof(nextTxLength));
+        return 0;
+
+    }
+    return -EINVAL;
+}
+
 static struct file_operations arf_fileops = {
         .owner          = THIS_MODULE,
         .open           = arf_open,             ///< takes 2 or more transactions from teh free transaction list and places them in the pending list and starts them
         .release        = arf_release,          ///< terminates DMA and takes all transactions and places them in the free transaction list
-        .read           = arf_read
+        .read           = arf_read,
+        .poll           = arf_poll,
+        .unlocked_ioctl = arf_unlocked_ioctl
 };
 
 static int ar_chardev_create(struct ar_channel* chan)
